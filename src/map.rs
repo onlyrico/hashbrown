@@ -8,8 +8,6 @@ use core::hash::{BuildHasher, Hash};
 use core::iter::{FromIterator, FusedIterator};
 use core::marker::PhantomData;
 use core::mem;
-#[cfg(feature = "nightly")]
-use core::mem::MaybeUninit;
 use core::ops::Index;
 
 /// Default hasher for `HashMap`.
@@ -244,6 +242,7 @@ where
     move |x| k.eq(x.borrow())
 }
 
+#[cfg(not(feature = "nightly"))]
 #[cfg_attr(feature = "inline-more", inline)]
 pub(crate) fn make_hash<K, Q, S>(hash_builder: &S, val: &Q) -> u64
 where
@@ -257,6 +256,18 @@ where
     state.finish()
 }
 
+#[cfg(feature = "nightly")]
+#[cfg_attr(feature = "inline-more", inline)]
+pub(crate) fn make_hash<K, Q, S>(hash_builder: &S, val: &Q) -> u64
+where
+    K: Borrow<Q>,
+    Q: Hash + ?Sized,
+    S: BuildHasher,
+{
+    hash_builder.hash_one(val)
+}
+
+#[cfg(not(feature = "nightly"))]
 #[cfg_attr(feature = "inline-more", inline)]
 pub(crate) fn make_insert_hash<K, S>(hash_builder: &S, val: &K) -> u64
 where
@@ -267,6 +278,16 @@ where
     let mut state = hash_builder.build_hasher();
     val.hash(&mut state);
     state.finish()
+}
+
+#[cfg(feature = "nightly")]
+#[cfg_attr(feature = "inline-more", inline)]
+pub(crate) fn make_insert_hash<K, S>(hash_builder: &S, val: &K) -> u64
+where
+    K: Hash,
+    S: BuildHasher,
+{
+    hash_builder.hash_one(val)
 }
 
 #[cfg(feature = "ahash")]
@@ -779,6 +800,52 @@ impl<K, V, S, A: Allocator + Clone> HashMap<K, V, S, A> {
     pub fn clear(&mut self) {
         self.table.clear();
     }
+
+    /// Creates a consuming iterator visiting all the keys in arbitrary order.
+    /// The map cannot be used after calling this.
+    /// The iterator element type is `K`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hashbrown::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.insert("a", 1);
+    /// map.insert("b", 2);
+    /// map.insert("c", 3);
+    ///
+    /// let vec: Vec<&str> = map.into_keys().collect();
+    /// ```
+    #[inline]
+    pub fn into_keys(self) -> IntoKeys<K, V, A> {
+        IntoKeys {
+            inner: self.into_iter(),
+        }
+    }
+
+    /// Creates a consuming iterator visiting all the values in arbitrary order.
+    /// The map cannot be used after calling this.
+    /// The iterator element type is `V`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hashbrown::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.insert("a", 1);
+    /// map.insert("b", 2);
+    /// map.insert("c", 3);
+    ///
+    /// let vec: Vec<i32> = map.into_values().collect();
+    /// ```
+    #[inline]
+    pub fn into_values(self) -> IntoValues<K, V, A> {
+        IntoValues {
+            inner: self.into_iter(),
+        }
+    }
 }
 
 impl<K, V, S, A> HashMap<K, V, S, A>
@@ -1149,16 +1216,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let mut pairs = self.get_each_inner_mut(ks);
-        // TODO use `MaybeUninit::uninit_array` here instead once that's stable.
-        let mut out: [MaybeUninit<Result<&'_ mut V, UnavailableMutError>>; N] =
-            unsafe { MaybeUninit::uninit().assume_init() };
-        for i in 0..N {
-            out[i] = MaybeUninit::new(
-                mem::replace(&mut pairs[i], Err(UnavailableMutError::Absent)).map(|(_, v)| v),
-            );
-        }
-        unsafe { MaybeUninit::array_assume_init(out) }
+        self.get_each_inner_mut(ks).map(|res| res.map(|(_, v)| v))
     }
 
     /// Attempts to get mutable references to `N` values in the map at once, with immutable
@@ -1208,17 +1266,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let mut pairs = self.get_each_inner_mut(ks);
-        // TODO use `MaybeUninit::uninit_array` here instead once that's stable.
-        let mut out: [MaybeUninit<Result<(&'_ K, &'_ mut V), UnavailableMutError>>; N] =
-            unsafe { MaybeUninit::uninit().assume_init() };
-        for i in 0..N {
-            out[i] = MaybeUninit::new(
-                mem::replace(&mut pairs[i], Err(UnavailableMutError::Absent))
-                    .map(|(k, v)| (&*k, v)),
-            );
-        }
-        unsafe { MaybeUninit::array_assume_init(out) }
+        self.get_each_inner_mut(ks)
+            .map(|res| res.map(|(k, v)| (&*k, v)))
     }
 
     #[cfg(feature = "nightly")]
@@ -1273,6 +1322,36 @@ where
                 .insert(hash, (k, v), make_hasher::<K, _, V, S>(&self.hash_builder));
             None
         }
+    }
+
+    /// Insert a key-value pair into the map without checking
+    /// if the key already exists in the map.
+    ///
+    /// Returns a reference to the key and value just inserted.
+    ///
+    /// This operation is safe if a key does not exist in the map.
+    ///
+    /// However, if a key exists in the map already, the behavior is unspecified:
+    /// this operation may panic, loop forever, or any following operation with the map
+    /// may panic, loop forever or return arbitrary result.
+    ///
+    /// That said, this operation (and following operations) are guaranteed to
+    /// not violate memory safety.
+    ///
+    /// This operation is faster than regular insert, because it does not perform
+    /// lookup before insertion.
+    ///
+    /// This operation is useful during initial population of the map.
+    /// For example, when constructing a map from another map, we know
+    /// that keys are unique.
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn insert_unique_unchecked(&mut self, k: K, v: V) -> (&K, &mut V) {
+        let hash = make_insert_hash::<K, S>(&self.hash_builder, &k);
+        let bucket = self
+            .table
+            .insert(hash, (k, v), make_hasher::<K, _, V, S>(&self.hash_builder));
+        let (k_ref, v_ref) = unsafe { bucket.as_mut() };
+        (k_ref, v_ref)
     }
 
     /// Tries to insert a key-value pair into the map, and returns
@@ -1581,6 +1660,88 @@ impl<K, V, A: Allocator + Clone> IntoIter<K, V, A> {
     }
 }
 
+/// An owning iterator over the keys of a `HashMap`.
+///
+/// This `struct` is created by the [`into_keys`] method on [`HashMap`].
+/// See its documentation for more.
+///
+/// [`into_keys`]: struct.HashMap.html#method.into_keys
+/// [`HashMap`]: struct.HashMap.html
+pub struct IntoKeys<K, V, A: Allocator + Clone = Global> {
+    inner: IntoIter<K, V, A>,
+}
+
+impl<K, V, A: Allocator + Clone> Iterator for IntoKeys<K, V, A> {
+    type Item = K;
+
+    #[inline]
+    fn next(&mut self) -> Option<K> {
+        self.inner.next().map(|(k, _)| k)
+    }
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for IntoKeys<K, V, A> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<K, V, A: Allocator + Clone> FusedIterator for IntoKeys<K, V, A> {}
+
+impl<K: Debug, V: Debug, A: Allocator + Clone> fmt::Debug for IntoKeys<K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.inner.iter().map(|(k, _)| k))
+            .finish()
+    }
+}
+
+/// An owning iterator over the values of a `HashMap`.
+///
+/// This `struct` is created by the [`into_values`] method on [`HashMap`].
+/// See its documentation for more.
+///
+/// [`into_values`]: struct.HashMap.html#method.into_values
+/// [`HashMap`]: struct.HashMap.html
+pub struct IntoValues<K, V, A: Allocator + Clone = Global> {
+    inner: IntoIter<K, V, A>,
+}
+
+impl<K, V, A: Allocator + Clone> Iterator for IntoValues<K, V, A> {
+    type Item = V;
+
+    #[inline]
+    fn next(&mut self) -> Option<V> {
+        self.inner.next().map(|(_, v)| v)
+    }
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<K, V, A: Allocator + Clone> ExactSizeIterator for IntoValues<K, V, A> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<K, V, A: Allocator + Clone> FusedIterator for IntoValues<K, V, A> {}
+
+impl<K: Debug, V: Debug, A: Allocator + Clone> fmt::Debug for IntoValues<K, V, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.inner.iter().map(|(k, _)| k))
+            .finish()
+    }
+}
+
 /// An iterator over the keys of a `HashMap`.
 ///
 /// This `struct` is created by the [`keys`] method on [`HashMap`]. See its
@@ -1692,7 +1853,7 @@ pub(super) struct ConsumeAllOnDrop<'a, T: Iterator>(pub &'a mut T);
 impl<T: Iterator> Drop for ConsumeAllOnDrop<'_, T> {
     #[cfg_attr(feature = "inline-more", inline)]
     fn drop(&mut self) {
-        self.0.for_each(drop)
+        self.0.for_each(drop);
     }
 }
 
@@ -1729,7 +1890,7 @@ impl<K, V, A: Allocator + Clone> DrainFilterInner<'_, K, V, A> {
         F: FnMut(&K, &mut V) -> bool,
     {
         unsafe {
-            while let Some(item) = self.iter.next() {
+            for item in &mut self.iter {
                 let &mut (ref key, ref mut value) = item.as_mut();
                 if f(key, value) {
                     return Some(self.table.remove(item));
@@ -3507,7 +3668,6 @@ mod test_map {
     use super::DefaultHashBuilder;
     use super::Entry::{Occupied, Vacant};
     use super::{HashMap, RawEntryMut};
-    use crate::TryReserveError::*;
     use rand::{rngs::SmallRng, Rng, SeedableRng};
     use std::borrow::ToOwned;
     use std::cell::RefCell;
@@ -3576,6 +3736,7 @@ mod test_map {
         assert_eq!(m.len(), 1);
         assert!(m.insert(2, 4).is_none());
         assert_eq!(m.len(), 2);
+        #[allow(clippy::redundant_clone)]
         let m2 = m.clone();
         assert_eq!(*m2.get(&1).unwrap(), 2);
         assert_eq!(*m2.get(&2).unwrap(), 4);
@@ -3729,6 +3890,7 @@ mod test_map {
                 }
             });
 
+            #[allow(clippy::let_underscore_drop)] // kind-of a false positive
             for _ in half.by_ref() {}
 
             DROP_VECTOR.with(|v| {
@@ -3895,6 +4057,18 @@ mod test_map {
     }
 
     #[test]
+    fn test_insert_unique_unchecked() {
+        let mut map = HashMap::new();
+        let (k1, v1) = map.insert_unique_unchecked(10, 11);
+        assert_eq!((&10, &mut 11), (k1, v1));
+        let (k2, v2) = map.insert_unique_unchecked(20, 21);
+        assert_eq!((&20, &mut 21), (k2, v2));
+        assert_eq!(Some(&11), map.get(&10));
+        assert_eq!(Some(&21), map.get(&20));
+        assert_eq!(None, map.get(&30));
+    }
+
+    #[test]
     fn test_is_empty() {
         let mut m = HashMap::with_capacity(4);
         assert!(m.insert(1, 2).is_none());
@@ -3940,7 +4114,7 @@ mod test_map {
     fn test_keys() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
         let map: HashMap<_, _> = vec.into_iter().collect();
-        let keys: Vec<_> = map.keys().cloned().collect();
+        let keys: Vec<_> = map.keys().copied().collect();
         assert_eq!(keys.len(), 3);
         assert!(keys.contains(&1));
         assert!(keys.contains(&2));
@@ -3951,7 +4125,7 @@ mod test_map {
     fn test_values() {
         let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
         let map: HashMap<_, _> = vec.into_iter().collect();
-        let values: Vec<_> = map.values().cloned().collect();
+        let values: Vec<_> = map.values().copied().collect();
         assert_eq!(values.len(), 3);
         assert!(values.contains(&'a'));
         assert!(values.contains(&'b'));
@@ -3963,13 +4137,37 @@ mod test_map {
         let vec = vec![(1, 1), (2, 2), (3, 3)];
         let mut map: HashMap<_, _> = vec.into_iter().collect();
         for value in map.values_mut() {
-            *value = (*value) * 2
+            *value *= 2;
         }
-        let values: Vec<_> = map.values().cloned().collect();
+        let values: Vec<_> = map.values().copied().collect();
         assert_eq!(values.len(), 3);
         assert!(values.contains(&2));
         assert!(values.contains(&4));
         assert!(values.contains(&6));
+    }
+
+    #[test]
+    fn test_into_keys() {
+        let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
+        let map: HashMap<_, _> = vec.into_iter().collect();
+        let keys: Vec<_> = map.into_keys().collect();
+
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&1));
+        assert!(keys.contains(&2));
+        assert!(keys.contains(&3));
+    }
+
+    #[test]
+    fn test_into_values() {
+        let vec = vec![(1, 'a'), (2, 'b'), (3, 'c')];
+        let map: HashMap<_, _> = vec.into_iter().collect();
+        let values: Vec<_> = map.into_values().collect();
+
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&'a'));
+        assert!(values.contains(&'b'));
+        assert!(values.contains(&'c'));
     }
 
     #[test]
@@ -4130,7 +4328,7 @@ mod test_map {
     fn test_from_iter() {
         let xs = [(1, 1), (2, 2), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let map: HashMap<_, _> = xs.iter().cloned().collect();
+        let map: HashMap<_, _> = xs.iter().copied().collect();
 
         for &(k, v) in &xs {
             assert_eq!(map.get(&k), Some(&v));
@@ -4143,7 +4341,7 @@ mod test_map {
     fn test_size_hint() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let map: HashMap<_, _> = xs.iter().cloned().collect();
+        let map: HashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter();
 
@@ -4156,7 +4354,7 @@ mod test_map {
     fn test_iter_len() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let map: HashMap<_, _> = xs.iter().cloned().collect();
+        let map: HashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter();
 
@@ -4169,7 +4367,7 @@ mod test_map {
     fn test_mut_size_hint() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+        let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter_mut();
 
@@ -4182,7 +4380,7 @@ mod test_map {
     fn test_iter_mut_len() {
         let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
 
-        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+        let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
         let mut iter = map.iter_mut();
 
@@ -4211,6 +4409,7 @@ mod test_map {
         map.insert(2, 1);
         map.insert(3, 4);
 
+        #[allow(clippy::no_effect)] // false positive lint
         map[&4];
     }
 
@@ -4218,7 +4417,7 @@ mod test_map {
     fn test_entry() {
         let xs = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
 
-        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+        let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
         // Existing key (insert)
         match map.entry(1) {
@@ -4277,18 +4476,18 @@ mod test_map {
         let mut m = HashMap::new();
 
         let mut rng = {
-            let seed = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-            SmallRng::from_seed(seed)
+            let seed = u64::from_le_bytes(*b"testseed");
+            SmallRng::seed_from_u64(seed)
         };
 
         // Populate the map with some items.
         for _ in 0..50 {
-            let x = rng.gen_range(-10, 10);
+            let x = rng.gen_range(-10..10);
             m.insert(x, ());
         }
 
         for _ in 0..1000 {
-            let x = rng.gen_range(-10, 10);
+            let x = rng.gen_range(-10..10);
             match m.entry(x) {
                 Vacant(_) => {}
                 Occupied(e) => {
@@ -4347,11 +4546,11 @@ mod test_map {
         let key = "hello there";
         let value = "value goes here";
         assert!(a.is_empty());
-        a.insert(key.clone(), value.clone());
+        a.insert(key, value);
         assert_eq!(a.len(), 1);
         assert_eq!(a[key], value);
 
-        match a.entry(key.clone()) {
+        match a.entry(key) {
             Vacant(_) => panic!(),
             Occupied(e) => assert_eq!(key, *e.key()),
         }
@@ -4366,11 +4565,11 @@ mod test_map {
         let value = "value goes here";
 
         assert!(a.is_empty());
-        match a.entry(key.clone()) {
+        match a.entry(key) {
             Occupied(_) => panic!(),
             Vacant(e) => {
                 assert_eq!(key, *e.key());
-                e.insert(value.clone());
+                e.insert(value);
             }
         }
         assert_eq!(a.len(), 1);
@@ -4587,18 +4786,18 @@ mod test_map {
         let mut m = HashMap::new();
 
         let mut rng = {
-            let seed = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-            SmallRng::from_seed(seed)
+            let seed = u64::from_le_bytes(*b"testseed");
+            SmallRng::seed_from_u64(seed)
         };
 
         // Populate the map with some items.
         for _ in 0..50 {
-            let x = rng.gen_range(-10, 10);
+            let x = rng.gen_range(-10..10);
             m.insert(x, ());
         }
 
         for _ in 0..1000 {
-            let x = rng.gen_range(-10, 10);
+            let x = rng.gen_range(-10..10);
             m.entry(x).and_replace_entry_with(|_, _| None);
             check(&m);
         }
@@ -4635,9 +4834,11 @@ mod test_map {
     #[test]
     #[cfg_attr(miri, ignore)] // FIXME: no OOM signalling (https://github.com/rust-lang/miri/issues/613)
     fn test_try_reserve() {
-        let mut empty_bytes: HashMap<u8, u8> = HashMap::new();
+        use crate::TryReserveError::{AllocError, CapacityOverflow};
 
         const MAX_USIZE: usize = usize::MAX;
+
+        let mut empty_bytes: HashMap<u8, u8> = HashMap::new();
 
         if let Err(CapacityOverflow) = empty_bytes.try_reserve(MAX_USIZE) {
         } else {
@@ -4664,9 +4865,9 @@ mod test_map {
     fn test_raw_entry() {
         use super::RawEntryMut::{Occupied, Vacant};
 
-        let xs = [(1i32, 10i32), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
+        let xs = [(1_i32, 10_i32), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
 
-        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+        let mut map: HashMap<_, _> = xs.iter().copied().collect();
 
         let compute_hash = |map: &HashMap<i32, i32>, k: i32| -> u64 {
             super::make_insert_hash::<i32, _>(map.hasher(), &k)
@@ -4739,7 +4940,7 @@ mod test_map {
         // Ensure all lookup methods produce equivalent results.
         for k in 0..12 {
             let hash = compute_hash(&map, k);
-            let v = map.get(&k).cloned();
+            let v = map.get(&k).copied();
             let kv = v.as_ref().map(|v| (&k, v));
 
             assert_eq!(map.raw_entry().from_key(&k), kv);
@@ -4809,8 +5010,6 @@ mod test_map {
     #[test]
     #[cfg(feature = "raw")]
     fn test_into_iter_refresh() {
-        use core::hash::{BuildHasher, Hash, Hasher};
-
         #[cfg(miri)]
         const N: usize = 32;
         #[cfg(not(miri))]
@@ -4818,13 +5017,13 @@ mod test_map {
 
         let mut rng = rand::thread_rng();
         for n in 0..N {
-            let mut m = HashMap::new();
+            let mut map = HashMap::new();
             for i in 0..n {
-                assert!(m.insert(i, 2 * i).is_none());
+                assert!(map.insert(i, 2 * i).is_none());
             }
-            let hasher = m.hasher().clone();
+            let hash_builder = map.hasher().clone();
 
-            let mut it = unsafe { m.table.iter() };
+            let mut it = unsafe { map.table.iter() };
             assert_eq!(it.len(), n);
 
             let mut i = 0;
@@ -4833,23 +5032,21 @@ mod test_map {
             loop {
                 // occasionally remove some elements
                 if i < n && rng.gen_bool(0.1) {
-                    let mut hsh = hasher.build_hasher();
-                    i.hash(&mut hsh);
-                    let hash = hsh.finish();
+                    let hash_value = super::make_insert_hash(&hash_builder, &i);
 
                     unsafe {
-                        let e = m.table.find(hash, |q| q.0.eq(&i));
+                        let e = map.table.find(hash_value, |q| q.0.eq(&i));
                         if let Some(e) = e {
                             it.reflect_remove(&e);
-                            let t = m.table.remove(e);
+                            let t = map.table.remove(e);
                             removed.push(t);
                             left -= 1;
                         } else {
                             assert!(removed.contains(&(i, 2 * i)), "{} not in {:?}", i, removed);
-                            let e = m.table.insert(
-                                hash,
+                            let e = map.table.insert(
+                                hash_value,
                                 (i, 2 * i),
-                                super::make_hasher::<usize, _, usize, _>(&hasher),
+                                super::make_hasher::<usize, _, usize, _>(&hash_builder),
                             );
                             it.reflect_insert(&e);
                             if let Some(p) = removed.iter().position(|e| e == &(i, 2 * i)) {
@@ -4867,14 +5064,14 @@ mod test_map {
                 assert!(i < n);
                 let t = unsafe { e.unwrap().as_ref() };
                 assert!(!removed.contains(t));
-                let (k, v) = t;
-                assert_eq!(*v, 2 * k);
+                let (key, value) = t;
+                assert_eq!(*value, 2 * key);
                 i += 1;
             }
             assert!(i <= n);
 
             // just for safety:
-            assert_eq!(m.table.len(), left);
+            assert_eq!(map.table.len(), left);
         }
     }
 
@@ -4896,7 +5093,7 @@ mod test_map {
         const EMPTY_MAP: HashMap<u32, std::string::String, MyHasher> =
             HashMap::with_hasher(MyHasher);
 
-        let mut map = EMPTY_MAP.clone();
+        let mut map = EMPTY_MAP;
         map.insert(17, "seventeen".to_owned());
         assert_eq!("seventeen", map[&17]);
     }
